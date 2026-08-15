@@ -68,4 +68,4 @@ jobs:
           path: |
             dist/at-webserver_1.0-34_all.ipk
             dist/luci-app-at-webserver_1.0-35_all.ipk
-            ../mt5700webui-openwrt-server-1.0-34-source.tar.gz
+            dist/mt5700webui-openwrt-server-1.0-34-source.tar.gz

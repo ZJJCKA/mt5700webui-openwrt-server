@@ -14,9 +14,8 @@ from build_at_webserver_ipk import DEFAULT_EPOCH, VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = ROOT.parent
 ARCHIVE_ROOT = "mt5700webui-openwrt-server"
-OUTPUT = WORKSPACE / f"mt5700webui-openwrt-server-{VERSION}-source.tar.gz"
+OUTPUT = ROOT / "dist" / f"mt5700webui-openwrt-server-{VERSION}-source.tar.gz"
 EXCLUDED_PARTS = {".git", "dist", "__pycache__"}
 EXECUTABLE_FILES = {
     "at-webserver/files/etc/init.d/at-webserver",
@@ -116,6 +115,7 @@ def main() -> None:
     files = source_files()
     payload = build_archive(files)
     verify_archive(payload, files)
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     temporary = OUTPUT.with_name(OUTPUT.name + ".new")
     temporary.write_bytes(payload)
     os.replace(temporary, OUTPUT)
