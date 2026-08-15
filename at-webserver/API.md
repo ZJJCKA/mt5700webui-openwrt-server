@@ -23,6 +23,7 @@ curl http://192.168.1.1/cgi-bin/at-ws-info
     "host": "192.168.1.1",
     "port": 8765,
     "allow_wan": 0,
+    "require_auth": false,
     "ws_url": "ws://192.168.1.1:8765",
     "timestamp": 1729756800
   }
@@ -37,6 +38,7 @@ curl http://192.168.1.1/cgi-bin/at-ws-info
 | data.host | string | WebSocket 主机地址 |
 | data.port | number | WebSocket 端口号 |
 | data.allow_wan | number | 是否允许外网访问 (0=否, 1=是) |
+| data.require_auth | boolean | 是否要求 WebSocket 连接密钥 |
 | data.ws_url | string | 完整的 WebSocket URL |
 | data.timestamp | number | Unix 时间戳 |
 
@@ -119,10 +121,11 @@ function App() {
 
 ### 注意事项
 
-1. **CORS 支持**：API 已启用 CORS，允许跨域访问
+1. **同源访问**：API 不开放跨域访问；浏览器 WebSocket 握手也会校验 Origin 与 Host 同主机
 2. **动态主机**：当允许外网访问时，API 会自动返回当前访问的主机名
 3. **缓存**：建议在每次需要连接时重新获取配置，而不是缓存
 4. **错误处理**：请务必处理 API 请求失败的情况
+5. **传输协议**：内置服务使用 `ws://`，页面应通过 HTTP 访问；HTTPS 页面需在反向代理中提供对应的 `wss://` 终止，否则浏览器会阻止混合内容
 
 ### 错误处理示例
 ```javascript
@@ -157,5 +160,5 @@ async function getWebSocketInfo() {
 
 1. 在生产环境中，建议限制此 API 的访问权限
 2. 如果不需要外网访问，请在配置中禁用 `allow_wan`
-3. 定期检查服务日志，监控异常访问
-
+3. 建议设置非空的 WebSocket 连接密钥
+4. 定期检查服务日志，监控异常访问

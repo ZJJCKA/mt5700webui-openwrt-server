@@ -9,8 +9,11 @@
 - Tab 顺序为：首页、配置、日志查看。
 - iframe 使用同源相对路径，自动继承当前 LuCI 的协议、主机地址和端口；用户修改 IPv4 管理地址后无需修改插件配置。
 - 配置页面的 Web 管理界面入口改为返回 LuCI 内嵌首页。
-- MT5700 流量累计值由后端每5秒主动查询并原子固化，设备断电重启后从上次记录继续累计。
-- WebUI 的“流量统计清零”会同时清除模组计数和持久化记录。
+- MT5700 流量累计值默认每 5 秒查询一次，但运行期间只更新内存，不周期写入 `/etc`。
+- 服务正常停止、重启或系统正常重启/关机时，后端会最后查询一次模组计数，再原子固化到 eMMC；下次启动恢复记录并继续累计。
+- WebUI 的“流量统计清零”会同时清除模组计数和持久化记录；这是运行期间唯一的即时落盘例外，避免旧累计在断电后复活。
+- 手机和电脑同时打开 WebUI 时，后认证成功的页面成为唯一控制页；旧页面立即退出插件且不会自动重连。
+- 页面隐藏或离开后停止前端定时刷新和后续消息处理以降低 CPU 负载；AT 服务、串口连接、流量累计和温度采集后台任务继续由 procd 保活。
 
 ## 页面入口
 
@@ -45,22 +48,29 @@ luci-app-at-webserver/root/usr/share/luci/menu.d/luci-app-at-webserver.json
 ```sh
 python3 tools/build_at_webserver_ipk.py
 python3 tools/build_luci_at_webserver_ipk.py
+python3 tools/build_source_archive.py
 ```
 
-输出为 `dist/at-webserver_1.0-20_all.ipk` 和 `dist/luci-app-at-webserver_1.0-34_all.ipk`，脚本会同时校验 IPK 成员、控制字段、文件内容、Unix 换行符和权限。
+输出为 `dist/at-webserver_1.0-34_all.ipk` 和 `dist/luci-app-at-webserver_1.0-35_all.ipk`，脚本会同时校验 IPK 成员、控制字段、文件内容、Unix 换行符和权限。`at-webserver` 依赖本机优化版 `luci-app-modem`，在 R3 Mini + MT5700 + `/dev/ttyUSB1` 时等待其开机 CFUN 初始化完成后再连接串口。该精确硬件组合还会每 5 秒通过 at-server 自身的 AT 命令锁更新 `/var/run/at-webserver/chiptemp.status`，供风扇插件只读使用，不写入 eMMC。
+
+源码归档脚本输出 `mt5700webui-openwrt-server-1.0-34-source.tar.gz`，固定顶层为
+`mt5700webui-openwrt-server/`，排除 `dist`、缓存文件和审计临时产物，并复核所有
+源码内容与 Unix 权限，可直接解压到编译机后复制两个软件包目录。
+
+这两个脚本用于快速构建和结构验证；正式固件请以 OpenWrt buildroot 编译结果为准。快速构建的 `at-webserver` IPK 不模拟 buildroot 自动生成的维护脚本，首次安装后需手动执行 `/etc/init.d/at-webserver enable` 和 `/etc/init.d/at-webserver restart`。
 
 ### 流量统计持久化
 
-默认状态文件为 `/etc/at-webserver/traffic-stats.json`，仅在累计值发生变化时写入。保存过程使用临时文件、`fsync` 和原子替换，突然断电最多损失一个保存间隔内（默认5秒）的新增流量。
+默认状态文件为 `/etc/at-webserver/traffic-stats.json`。运行期间默认每 5 秒读取一次模组计数并只在内存中累计，不执行周期性 eMMC 写入。服务收到正常停止信号时，会在 AT 连接仍可用的情况下最后查询一次，然后通过临时文件、文件 `fsync`、原子替换和目录 `fsync` 固化一次；正常重启后会恢复该快照并继续累计。
 
 ```sh
 uci set at-webserver.config.traffic_persist_enabled='1'
-uci set at-webserver.config.traffic_persist_interval='5'
+uci set at-webserver.config.traffic_poll_interval='5'
 uci commit at-webserver
 /etc/init.d/at-webserver restart
 ```
 
-持续大流量场景下，每5秒写入会增加闪存写入次数；如设备使用普通 NAND/NOR，可将间隔调整为 `30` 或 `60` 秒。
+正常运行期间不因采样而写入持久层；每次正常停止、服务重启、系统重启或关机最多固化一次。主动执行流量清零时会额外立即固化一次。突然断电、强制断电、服务异常崩溃、内核崩溃或 `kill -9` 不执行正常退出固化，因此本次开机尚未固化的增量可能丢失，重启后从上一次成功固化的快照继续累计。异常退出不落盘也可避免 procd 启动失败循环反复磨损 eMMC。
 
 ---
 
@@ -77,6 +87,3 @@ uci commit at-webserver
 <img width="2457" height="1326" alt="9(TM7)SQA1G0Q}6V9Y3JO)Y" src="https://github.com/user-attachments/assets/a002f79c-335a-4dfd-9a5d-8df1a1dac736" />
 <img width="2443" height="1335" alt="`SQWWP VX7%L~B8J%3C(X8" src="https://github.com/user-attachments/assets/a9a0a84c-5ea5-4c4f-96b9-35f2d53f269d" />
 <img width="2452" height="1318" alt="`RR6H0LRW9L5{M5{L82NX_2" src="https://github.com/user-attachments/assets/d4290143-69fc-4211-8d97-b1527f77d7ff" />
-
-
-

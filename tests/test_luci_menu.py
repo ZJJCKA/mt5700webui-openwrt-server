@@ -13,6 +13,16 @@ MENU_FILE = (
     / "menu.d"
     / "luci-app-at-webserver.json"
 )
+DEBUG_VIEW = (
+    Path(__file__).resolve().parents[1]
+    / "luci-app-at-webserver"
+    / "htdocs"
+    / "luci-static"
+    / "resources"
+    / "view"
+    / "at-webserver"
+    / "debug.js"
+)
 
 
 class LuciMenuTests(unittest.TestCase):
@@ -31,6 +41,11 @@ class LuciMenuTests(unittest.TestCase):
             "日志查看", menu["admin/services/at-webserver/logs"]["title"]
         )
         self.assertNotIn("admin/modem/tdtech", menu)
+
+    def test_legacy_debug_output_does_not_interpret_modem_html(self):
+        source = DEBUG_VIEW.read_text(encoding="utf-8")
+        self.assertNotIn("innerHTML", source)
+        self.assertIn("messageEl.textContent", source)
 
 
 if __name__ == "__main__":

@@ -3,11 +3,12 @@
 
 import argparse
 import hashlib
-import json
+import os
 from pathlib import Path
 from typing import Dict, Tuple
 
 from build_at_webserver_ipk import (
+    DEFAULT_EPOCH,
     archive_members,
     make_tar_gz,
     normalized_name,
@@ -17,7 +18,7 @@ from build_at_webserver_ipk import (
 
 
 PACKAGE = "luci-app-at-webserver"
-VERSION = "1.0-34"
+VERSION = "1.0-35"
 ARCHITECTURE = "all"
 
 
@@ -41,7 +42,7 @@ def make_control(data_size: int, epoch: int) -> bytes:
     fields = [
         "Package: {}".format(PACKAGE),
         "Version: {}".format(VERSION),
-        "Depends: libc, luci-base, at-webserver, luci-app-modem",
+        "Depends: libc, luci-base, at-webserver",
         "Source: package/{}".format(PACKAGE),
         "SourceName: {}".format(PACKAGE),
         "Section: luci",
@@ -85,12 +86,15 @@ def verify_ipk(repo_root: Path, destination: Path) -> str:
         "Package: {}".format(PACKAGE),
         "Version: {}".format(VERSION),
         "Architecture: {}".format(ARCHITECTURE),
+        "Depends: libc, luci-base, at-webserver",
     ):
         if field not in control_text:
             raise ValueError("control metadata is incomplete")
 
     data = archive_members(outer["data.tar.gz"][0])
     source_files = collect_data_files(repo_root)
+    if "Installed-Size: {}".format(len(outer["data.tar.gz"][0])) not in control_text:
+        raise ValueError("Installed-Size does not match data.tar.gz")
     if set(data) != {normalized_name(name) for name in source_files}:
         raise ValueError("packaged file list does not match the source tree")
     for source_name, expected in source_files.items():
@@ -98,25 +102,11 @@ def verify_ipk(repo_root: Path, destination: Path) -> str:
         if actual != expected:
             raise ValueError("packaged data mismatch: {}".format(source_name))
 
-    menu_text = data[
+    menu = data[
         "usr/share/luci/menu.d/luci-app-at-webserver.json"
     ][0].decode("utf-8")
-    menu = json.loads(menu_text)
-    service_entry = menu.get("admin/services/at-webserver", {})
-    if service_entry.get("title") != "AT WebServer":
-        raise ValueError("AT WebServer service menu title is missing")
-    if service_entry.get("order") != -10:
-        raise ValueError("AT WebServer service menu priority is invalid")
-    expected_children = {
-        "admin/services/at-webserver/home": "首页",
-        "admin/services/at-webserver/config": "配置",
-        "admin/services/at-webserver/logs": "日志查看",
-    }
-    for path, title in expected_children.items():
-        if menu.get(path, {}).get("title") != title:
-            raise ValueError("invalid service submenu: {}".format(path))
-    if "admin/modem/tdtech" in menu:
-        raise ValueError("orphaned modem submenu is still present")
+    if '"order": -10' not in menu:
+        raise ValueError("LuCI service menu priority is missing")
     return hashlib.sha256(package_payload).hexdigest()
 
 
@@ -130,7 +120,13 @@ def main() -> None:
     destination = args.output or (
         repo_root / "dist" / "{}_{}_{}.ipk".format(PACKAGE, VERSION, ARCHITECTURE)
     )
-    epoch = args.epoch or 1785907200
+    epoch = (
+        args.epoch
+        if args.epoch is not None
+        else int(os.environ.get("SOURCE_DATE_EPOCH", str(DEFAULT_EPOCH)))
+    )
+    if epoch < 0:
+        parser.error("--epoch must be non-negative")
     build_ipk(repo_root, destination, epoch)
     digest = verify_ipk(repo_root, destination)
     print(destination.resolve())

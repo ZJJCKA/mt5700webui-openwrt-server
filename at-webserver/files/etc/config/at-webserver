@@ -16,8 +16,8 @@ config at-webserver 'config'
 	option websocket_auth_key ''            # WebSocket 连接密钥（留空则不验证）
 
 	# 流量统计持久化
-	option traffic_persist_enabled '1'       # 保存模组累计流量，断电重启后继续累计
-	option traffic_persist_interval '5'      # 主动查询并固化的间隔（秒）
+	option traffic_persist_enabled '1'       # 正常停止、重启或关机时固化，启动后恢复累计
+	option traffic_poll_interval '5'         # 运行时内存采集间隔（秒），不会写入持久层
 	option traffic_state_file '/etc/at-webserver/traffic-stats.json'
 	
 	# 通知配置
@@ -68,4 +68,3 @@ config at-webserver 'config'
 	option schedule_day_nr_arfcns ''         # NR频点
 	option schedule_day_nr_scs_types ''      # NR SCS类型
 	option schedule_day_nr_pcis ''           # NR PCI
-

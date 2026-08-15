@@ -218,12 +218,12 @@ return view.extend({
 	};
 
 	o = s.option(form.Flag, 'traffic_persist_enabled', _('启用流量统计固化'),
-		_('后台主动读取模组累计值，并使用原子写入保存到持久存储。'));
+		_('运行时只在内存累计；正常停止、服务重启、系统重启或关机时才原子写入持久存储。'));
 	o.rmempty = false;
 	o.default = '1';
 
-	o = s.option(form.Value, 'traffic_persist_interval', _('固化间隔（秒）'),
-		_('默认每5秒保存一次。持续产生流量时会按此频率写入存储；增大间隔可减少闪存写入次数。'));
+	o = s.option(form.Value, 'traffic_poll_interval', _('内存采集间隔（秒）'),
+		_('默认每5秒查询一次模组并只更新内存，用于识别模组中途复位；不会周期写入 eMMC。'));
 	o.datatype = 'range(1,3600)';
 	o.default = '5';
 	o.rmempty = false;
@@ -232,7 +232,7 @@ return view.extend({
 		// Web界面链接
 		o = s.option(form.DummyValue, '_webui', _('Web 管理界面'));
 		o.cfgvalue = function() {
-			var url = L.url('admin/modem/tdtech/home');
+			var url = L.url('admin/services/at-webserver/home');
 			return '<a href="' + url + '" style="color:#0099CC">' +
 			       _('进入内嵌 Web 管理界面') + '</a>';
 		};
@@ -252,8 +252,13 @@ return view.extend({
 
 		// 日志文件
 		o = s.option(form.Value, 'log_file', _('日志文件'),
-			_('保存通知记录的日志文件路径，留空则不启用日志记录'));
+			_('保存通知记录的日志文件路径；支持 /tmp/at-notifications.log 或 /var/log/at-notifications.log，留空则不启用'));
 		o.placeholder = '/var/log/at-notifications.log';
+		o.validate = function(section_id, value) {
+			if (!value || value === '/tmp/at-notifications.log' || value === '/var/log/at-notifications.log')
+				return true;
+			return _('仅支持 /tmp/at-notifications.log 或 /var/log/at-notifications.log');
+		};
 
 		// 通知类型标题（使用 DummyValue 作为分隔）
 		o = s.option(form.DummyValue, '_notify_types_title', _('通知类型'));
@@ -402,37 +407,16 @@ return view.extend({
 	},
 
 	handleSaveApply: function(ev, mode) {
-		return this.handleSave(ev).then(L.bind(function() {
-			// 等待一下确保 UCI 已提交
-			return new Promise(function(resolve) {
-				setTimeout(resolve, 500);
-			}).then(L.bind(function() {
-				return this.handleRestart(ev);
-			}, this));
+		return this.handleSave(ev).then(function() {
+			return uci.apply();
+		}).then(L.bind(function() {
+			return this.handleRestart(ev);
 		}, this));
 	},
 
 	handleSave: function(ev) {
-		var map = document.querySelector('.cbi-map');
-		
 		return this.super('handleSave', [ev]).then(L.bind(function() {
-			// 显式提交 UCI 配置
-			return uci.save().then(function() {
-				return uci.apply();
-			}).then(function() {
-				// 强制提交 at-webserver 配置
-				return uci.save('at-webserver');
-			}).then(function() {
-				// 确保 enabled 字段被正确保存
-				var enabledValue = map.querySelector('input[name="cbid.at-webserver.config.enabled"]');
-				if (enabledValue) {
-					var isEnabled = enabledValue.checked ? '1' : '0';
-					uci.set('at-webserver', 'config', 'enabled', isEnabled);
-					uci.save('at-webserver');
-					uci.commit('at-webserver');
-				}
-				ui.addNotification(null, E('p', _('✓ 配置已保存并提交')), 'success');
-			});
+			ui.addNotification(null, E('p', _('✓ 配置已保存')), 'success');
 		}, this)).catch(L.bind(function(e) {
 			ui.addNotification(null, E('p', _('保存配置失败: ') + (e.message || e)), 'error');
 			throw e;
@@ -440,33 +424,49 @@ return view.extend({
 	},
 
 	handleRestart: function(ev) {
-		ui.showModal(_('重启服务'), [
-			E('p', { 'class': 'spinning' }, _('正在重启 AT WebServer 服务...'))
+		var enabled = uci.get('at-webserver', 'config', 'enabled') === '1';
+		var runAction = function(action) {
+			return callInitAction('at-webserver', action).then(function(success) {
+				if (success !== true)
+					throw new Error(_('服务操作失败: ') + action);
+			});
+		};
+
+		ui.showModal(enabled ? _('重启服务') : _('停止服务'), [
+			E('p', { 'class': 'spinning' }, enabled ?
+				_('正在重启 AT WebServer 服务...') :
+				_('正在停止 AT WebServer 服务...'))
 		]);
 
-		// 先停止服务，再启动服务，确保配置重新加载
-		return callInitAction('at-webserver', 'stop').then(function() {
-			return new Promise(function(resolve) { 
-				setTimeout(resolve, 2000); 
+		return runAction('stop').then(function() {
+			if (!enabled)
+				return null;
+
+			return new Promise(function(resolve) {
+				setTimeout(resolve, 1000);
+			}).then(function() {
+				return runAction('start');
 			});
 		}).then(function() {
-			return callInitAction('at-webserver', 'start');
-		}).then(function() {
-			return new Promise(function(resolve) { 
-				setTimeout(resolve, 3000); 
+			return new Promise(function(resolve) {
+				setTimeout(resolve, enabled ? 2000 : 500);
 			});
 		}).then(function() {
 			ui.hideModal();
-			ui.addNotification(null, E('p', _('✓ 服务已重启，配置已生效')), 'success');
-			setTimeout(function() { 
-				window.location.reload(true); 
+			ui.addNotification(null, E('p', enabled ?
+				_('✓ 服务已重启，配置已生效') :
+				_('✓ 配置已保存，服务已停用')), 'success');
+			setTimeout(function() {
+				window.location.reload(true);
 			}, 1000);
 		}).catch(function(e) {
 			ui.hideModal();
-			ui.addNotification(null, E('p', _('重启服务失败: ') + (e.message || e)), 'error');
+			ui.addNotification(null, E('p', (enabled ?
+				_('重启服务失败: ') :
+				_('停止服务失败: ')) + (e.message || e)), 'error');
+			throw e;
 		});
 	},
 
 	handleReset: null
 });
-

@@ -5,7 +5,6 @@ STOP=10
 
 USE_PROCD=1
 PROG=/usr/bin/at-server.py
-PROG_NAME="at-server.py"
 
 start_service() {
 	local enabled
@@ -43,7 +42,18 @@ start_service() {
 	# 自动检测并添加 USB 串口设备 ID（如果需要）
 	detect_and_add_usb_serial() {
 		# 仅在发现 MT5700 且尚无 ttyUSB* 时处理
-		if ! lsusb -d 3466:3301 >/dev/null 2>&1; then
+		local usbdev vendor product found=0
+		for usbdev in /sys/bus/usb/devices/*; do
+			[ -r "$usbdev/idVendor" ] || continue
+			[ -r "$usbdev/idProduct" ] || continue
+			IFS= read -r vendor < "$usbdev/idVendor"
+			IFS= read -r product < "$usbdev/idProduct"
+			if [ "$vendor" = "3466" ] && [ "$product" = "3301" ]; then
+				found=1
+				break
+			fi
+		done
+		if [ "$found" -ne 1 ]; then
 			return 0
 		fi
 		if ls /dev/ttyUSB* >/dev/null 2>&1; then
@@ -203,10 +213,6 @@ start_service() {
 	
 	setup_firewall
 	
-	# 确保没有旧进程在运行
-	killall -q -9 "$PROG_NAME" 2>/dev/null
-	sleep 1
-	
 	logger -t at-webserver "配置 procd 实例..."
 	echo "Starting AT WebServer..."
 	
@@ -214,9 +220,9 @@ start_service() {
 	procd_open_instance
 	procd_set_param command python3 "$PROG"
 	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
+	procd_set_param term_timeout 15
 	procd_set_param stdout 1
 	procd_set_param stderr 1
-	procd_set_param pidfile /var/run/at-webserver.pid
 	procd_close_instance
 	
 	logger -t at-webserver "服务启动配置完成，等待 procd 启动进程"
@@ -226,12 +232,6 @@ start_service() {
 stop_service() {
 	logger -t at-webserver "停止服务..."
 	echo "Stopping AT WebServer..."
-	
-	# 强制杀死所有相关进程
-	killall -q -9 "$PROG_NAME" 2>/dev/null
-	
-	# 清理 pidfile
-	rm -f /var/run/at-webserver.pid
 	
 	# 清理防火墙规则
 	# 清理 WebSocket WAN 阻止规则
@@ -281,19 +281,10 @@ stop_service() {
 reload_service() {
 	logger -t at-webserver "重新加载配置..."
 	echo "Reloading AT WebServer configuration..."
-	
-	# 提交最新配置
-	uci -q commit at-webserver
-	
-	# 强制停止所有相关进程
-	killall -q -9 "$PROG_NAME" 2>/dev/null
-	rm -f /var/run/at-webserver.pid
-	
-	# 等待进程完全停止
-	sleep 3
-	
-	# 重新启动服务
-	start_service
+
+	# 由 rc.common/procd 完整停止旧实例后再创建新实例。
+	stop
+	start
 	
 	logger -t at-webserver "配置重新加载完成"
 }

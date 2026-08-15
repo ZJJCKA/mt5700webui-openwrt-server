@@ -24,6 +24,5 @@ www/
 使用方法：
 ---------
 1. 将你的前端文件放入 5700/ 目录
-2. 运行 make package/nradio/at-webserver/compile
+2. 运行 make package/mt5700webui-openwrt-server/at-webserver/compile V=s
 3. 安装生成的 IPK 包
-
