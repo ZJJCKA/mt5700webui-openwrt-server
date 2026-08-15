@@ -129,11 +129,14 @@ class TrafficStatsStore:
         return response[: match.start("values")] + values + response[match.end("values") :]
 
     def reset(self) -> None:
-        """Reset both logical totals and the persisted modem baseline."""
+        """Reset totals and durably record the explicit user action."""
         self._totals = {name: 0 for name in self.COUNTERS}
         self._raw = {name: 0 for name in self.COUNTERS}
         self._initialized = True
         self._dirty = True
+        # A manual clear is intentionally the only runtime write exception.
+        # Persist it immediately so an abrupt power loss cannot resurrect the
+        # pre-clear totals from the previous shutdown snapshot.
         self.flush(force=True)
 
     def flush(self, force: bool = False) -> bool:

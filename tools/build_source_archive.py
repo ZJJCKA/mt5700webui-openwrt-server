@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Build a Linux-permission-safe OpenWrt source archive for this project."""
+"""Build a deterministic compiler-ready source archive."""
+
+from __future__ import annotations
 
 import gzip
 import hashlib
@@ -8,132 +10,119 @@ import os
 import tarfile
 from pathlib import Path, PurePosixPath
 
+from build_at_webserver_ipk import DEFAULT_EPOCH, VERSION
 
-VERSION = "1.0-20"
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE = ROOT.parent
 ARCHIVE_ROOT = "mt5700webui-openwrt-server"
-PACKAGE_DIRS = ("at-webserver", "luci-app-at-webserver")
+OUTPUT = WORKSPACE / f"mt5700webui-openwrt-server-{VERSION}-source.tar.gz"
+EXCLUDED_PARTS = {".git", "dist", "__pycache__"}
 EXECUTABLE_FILES = {
     "at-webserver/files/etc/init.d/at-webserver",
     "at-webserver/files/usr/bin/at-server.py",
-    "at-webserver/files/www/cgi-bin/at-log-clear",
     "at-webserver/files/www/cgi-bin/at-ws-info",
+    "tools/build_at_webserver_ipk.py",
+    "tools/build_luci_at_webserver_ipk.py",
+    "tools/build_source_archive.py",
 }
-BINARY_SUFFIXES = {".ico", ".png"}
 
 
-def excluded(path: Path) -> bool:
-    return (
-        "__pycache__" in path.parts
-        or path.suffix in {".pyc", ".pyo", ".backup", ".orig"}
-        or path.name.endswith("~")
-    )
+def source_files() -> dict[str, tuple[bytes, int]]:
+    result: dict[str, tuple[bytes, int]] = {}
+    for path in sorted(ROOT.rglob("*")):
+        relative_path = path.relative_to(ROOT)
+        if any(part in EXCLUDED_PARTS for part in relative_path.parts):
+            continue
+        if path.is_symlink():
+            raise RuntimeError(f"source symlink is not allowed: {relative_path}")
+        if not path.is_file() or path.suffix == ".pyc":
+            continue
+        relative = relative_path.as_posix()
+        mode = 0o755 if relative in EXECUTABLE_FILES else 0o644
+        result[relative] = (path.read_bytes(), mode)
+    missing = EXECUTABLE_FILES.difference(result)
+    if missing:
+        raise RuntimeError(f"missing executable source files: {sorted(missing)}")
+    return result
 
 
-def source_files(repo_root: Path):
-    selected = []
-    for directory in PACKAGE_DIRS:
-        root = repo_root / directory
-        selected.extend(
-            path for path in root.rglob("*") if path.is_file() and not excluded(path)
-        )
-    selected.append(repo_root / "README.md")
-    return sorted(set(selected))
+def parent_directories(files: dict[str, tuple[bytes, int]]) -> set[str]:
+    directories = {ARCHIVE_ROOT}
+    for relative in files:
+        current = PurePosixPath(ARCHIVE_ROOT, relative).parent
+        while str(current) not in ("", "."):
+            directories.add(current.as_posix())
+            if current.as_posix() == ARCHIVE_ROOT:
+                break
+            current = current.parent
+    return directories
 
 
-def file_payload(path: Path) -> bytes:
-    payload = path.read_bytes()
-    if path.suffix.lower() not in BINARY_SUFFIXES:
-        payload = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    return payload
-
-
-def tar_info(name: str, mode: int, epoch: int, size: int = 0) -> tarfile.TarInfo:
+def archive_info(name: str, mode: int, size: int = 0) -> tarfile.TarInfo:
     info = tarfile.TarInfo(name)
     info.mode = mode
     info.uid = 0
     info.gid = 0
     info.uname = "root"
     info.gname = "root"
-    info.mtime = epoch
+    info.mtime = DEFAULT_EPOCH
     info.size = size
     return info
 
 
-def build(repo_root: Path, destination: Path, epoch: int) -> None:
-    sources = source_files(repo_root)
-    names = {
-        source: "{}/{}".format(
-            ARCHIVE_ROOT, source.relative_to(repo_root).as_posix()
-        )
-        for source in sources
-    }
-    directories = {ARCHIVE_ROOT}
-    for name in names.values():
-        for parent in PurePosixPath(name).parents:
-            if str(parent) != ".":
-                directories.add(parent.as_posix())
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("wb") as raw:
-        with gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as compressed:
-            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as archive:
-                for directory in sorted(
-                    directories,
-                    key=lambda item: (len(PurePosixPath(item).parts), item),
-                ):
-                    info = tar_info(directory + "/", 0o755, epoch)
-                    info.type = tarfile.DIRTYPE
-                    archive.addfile(info)
-
-                for source in sources:
-                    relative = source.relative_to(repo_root).as_posix()
-                    mode = 0o755 if relative in EXECUTABLE_FILES else 0o644
-                    payload = file_payload(source)
-                    archive.addfile(
-                        tar_info(names[source], mode, epoch, len(payload)),
-                        io.BytesIO(payload),
-                    )
+def build_archive(files: dict[str, tuple[bytes, int]]) -> bytes:
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=output, mode="wb", mtime=DEFAULT_EPOCH, filename="") as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as archive:
+            for directory in sorted(parent_directories(files)):
+                info = archive_info(directory + "/", 0o755)
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+            for relative, (content, mode) in sorted(files.items()):
+                name = f"{ARCHIVE_ROOT}/{relative}"
+                archive.addfile(archive_info(name, mode, len(content)), io.BytesIO(content))
+    return output.getvalue()
 
 
-def verify(repo_root: Path, destination: Path) -> str:
-    expected = {
-        "{}/{}".format(ARCHIVE_ROOT, path.relative_to(repo_root).as_posix())
-        for path in source_files(repo_root)
-    }
-    with tarfile.open(destination, mode="r:gz") as archive:
-        files = {member.name: member for member in archive.getmembers() if member.isfile()}
-        if set(files) != expected:
-            raise ValueError("source archive file list mismatch")
-
-        for name, member in files.items():
-            relative = name[len(ARCHIVE_ROOT) + 1 :]
-            expected_mode = 0o755 if relative in EXECUTABLE_FILES else 0o644
-            if member.mode != expected_mode:
-                raise ValueError("mode mismatch: {}".format(name))
-            if excluded(Path(relative)):
-                raise ValueError("build artifact leaked into source archive: {}".format(name))
-
-            if relative in EXECUTABLE_FILES or relative.endswith("/Makefile"):
-                extracted = archive.extractfile(member)
-                if extracted is None or b"\r" in extracted.read():
-                    raise ValueError("non-Unix line endings: {}".format(name))
-
-    return hashlib.sha256(destination.read_bytes()).hexdigest()
+def verify_archive(payload: bytes, files: dict[str, tuple[bytes, int]]) -> None:
+    expected = {f"{ARCHIVE_ROOT}/{name}": value for name, value in files.items()}
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        actual_files: dict[str, tuple[bytes, int]] = {}
+        roots = set()
+        for member in archive.getmembers():
+            path = PurePosixPath(member.name)
+            if path.is_absolute() or ".." in path.parts:
+                raise RuntimeError(f"unsafe source member: {member.name}")
+            if path.parts:
+                roots.add(path.parts[0])
+            if member.isdir():
+                if member.mode & 0o777 != 0o755:
+                    raise RuntimeError(f"invalid directory mode: {member.name}")
+                continue
+            if not member.isfile():
+                raise RuntimeError(f"unsupported source member: {member.name}")
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise RuntimeError(f"cannot read source member: {member.name}")
+            actual_files[member.name] = (extracted.read(), member.mode & 0o777)
+    if roots != {ARCHIVE_ROOT}:
+        raise RuntimeError(f"invalid archive roots: {sorted(roots)}")
+    if actual_files != expected:
+        raise RuntimeError("source archive content or mode mismatch")
 
 
 def main() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    destination = (
-        repo_root
-        / "dist"
-        / "mt5700webui-openwrt-server-{}-source.tar.gz".format(VERSION)
-    )
-    epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "1786075675"))
-    build(repo_root, destination, epoch)
-    digest = verify(repo_root, destination)
-    print(destination.resolve())
-    print("size={}".format(destination.stat().st_size))
-    print("sha256={}".format(digest))
+    files = source_files()
+    payload = build_archive(files)
+    verify_archive(payload, files)
+    temporary = OUTPUT.with_name(OUTPUT.name + ".new")
+    temporary.write_bytes(payload)
+    os.replace(temporary, OUTPUT)
+    print(OUTPUT)
+    print(f"files={len(files)}")
+    print(f"size={len(payload)}")
+    print(f"sha256={hashlib.sha256(payload).hexdigest()}")
 
 
 if __name__ == "__main__":

@@ -7,14 +7,14 @@ import hashlib
 import io
 import os
 import tarfile
-import time
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Tuple
 
 
 PACKAGE = "at-webserver"
-VERSION = "1.0-20"
+VERSION = "1.0-34"
 ARCHITECTURE = "all"
+DEFAULT_EPOCH = 1786320000  # 2026-08-10 00:00:00 UTC
 DEPENDENCIES = (
     "libc",
     "python3",
@@ -22,6 +22,8 @@ DEPENDENCIES = (
     "python3-websockets",
     "python3-pyserial",
     "python3-aiohttp",
+    "ca-bundle",
+    "luci-app-modem",
 )
 
 
@@ -109,10 +111,6 @@ def collect_data_files(repo_root: Path) -> Dict[str, Tuple[bytes, int]]:
             read_unix_text(source_root / "www/cgi-bin/at-ws-info"),
             0o755,
         ),
-        "./www/cgi-bin/at-log-clear": (
-            read_unix_text(source_root / "www/cgi-bin/at-log-clear"),
-            0o755,
-        ),
     }
 
     web_root = source_root / "www" / "5700"
@@ -193,6 +191,7 @@ def verify_ipk(repo_root: Path, destination: Path) -> str:
         "Package: {}".format(PACKAGE),
         "Version: {}".format(VERSION),
         "Architecture: {}".format(ARCHITECTURE),
+        "Depends: {}".format(", ".join(DEPENDENCIES)),
     )
     if any(field not in control_text for field in required_fields):
         raise ValueError("control metadata is incomplete")
@@ -201,6 +200,8 @@ def verify_ipk(repo_root: Path, destination: Path) -> str:
 
     data = archive_members(outer["data.tar.gz"][0])
     source_files = collect_data_files(repo_root)
+    if "Installed-Size: {}".format(len(outer["data.tar.gz"][0])) not in control_text:
+        raise ValueError("Installed-Size does not match data.tar.gz")
     if set(data) != {normalized_name(name) for name in source_files}:
         raise ValueError("packaged file list does not match the source tree")
     for source_name, (source_content, source_mode) in source_files.items():
@@ -215,7 +216,6 @@ def verify_ipk(repo_root: Path, destination: Path) -> str:
         "usr/bin/at-server.py",
         "usr/bin/traffic_stats.py",
         "www/cgi-bin/at-ws-info",
-        "www/cgi-bin/at-log-clear",
     )
     for name in router_text:
         if b"\r" in data[name][0]:
@@ -228,13 +228,20 @@ def verify_ipk(repo_root: Path, destination: Path) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--epoch", type=int)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]
     destination = args.output or (
         repo_root / "dist" / "{}_{}_{}.ipk".format(PACKAGE, VERSION, ARCHITECTURE)
     )
-    epoch = int(os.environ.get("SOURCE_DATE_EPOCH", str(int(time.time()))))
+    epoch = (
+        args.epoch
+        if args.epoch is not None
+        else int(os.environ.get("SOURCE_DATE_EPOCH", str(DEFAULT_EPOCH)))
+    )
+    if epoch < 0:
+        parser.error("--epoch must be non-negative")
 
     build_ipk(repo_root, destination, epoch)
     digest = verify_ipk(repo_root, destination)

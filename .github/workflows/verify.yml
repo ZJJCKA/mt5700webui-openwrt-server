@@ -1,0 +1,71 @@
+name: Verify AT WebServer
+
+on:
+  push:
+    branches:
+      - main
+      - "codex/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check aiohttp pyserial websockets
+
+      - name: Verify Python and shell syntax
+        run: |
+          python -m py_compile \
+            at-webserver/files/usr/bin/at-server.py \
+            at-webserver/files/usr/bin/traffic_stats.py \
+            tools/build_at_webserver_ipk.py \
+            tools/build_luci_at_webserver_ipk.py \
+            tools/build_source_archive.py
+          sh -n at-webserver/files/etc/init.d/at-webserver
+          sh -n at-webserver/files/www/cgi-bin/at-ws-info
+
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Run browser-session tests
+        run: |
+          node --check at-webserver/files/www/5700/scripts/session-guard.js
+          node --check luci-app-at-webserver/htdocs/luci-static/resources/view/at-webserver/config.js
+          node --check luci-app-at-webserver/htdocs/luci-static/resources/view/at-webserver/debug.js
+          node --check luci-app-at-webserver/htdocs/luci-static/resources/view/at-webserver/logs.js
+          node tests/test_session_guard.js
+
+      - name: Build and verify packages
+        run: |
+          python tools/build_at_webserver_ipk.py
+          python tools/build_luci_at_webserver_ipk.py
+          python tools/build_source_archive.py
+
+      - name: Upload verified packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: at-webserver-verified-packages
+          if-no-files-found: error
+          path: |
+            dist/at-webserver_1.0-34_all.ipk
+            dist/luci-app-at-webserver_1.0-35_all.ipk
+            ../mt5700webui-openwrt-server-1.0-34-source.tar.gz

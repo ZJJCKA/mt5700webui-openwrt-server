@@ -1,4 +1,9 @@
+#!/usr/bin/python3
+
 import asyncio
+import copy
+import glob
+import signal
 import socket
 import time
 import re
@@ -11,17 +16,46 @@ import json
 import sys
 import serial
 import os
+import stat
 from datetime import datetime
 import logging
+from urllib.parse import urlsplit
 from traffic_stats import TrafficStatsStore
 
-# 配置日志
-logging.basicConfig(
-    level=logging.WARNING,  # 默认只记录警告和错误，减少日志输出
-    format='%(asctime)s [%(levelname)s] %(message)s',
+
+CHIPTEMP_CACHE_DIR = "/var/run/at-webserver"
+CHIPTEMP_CACHE_FILE = os.path.join(CHIPTEMP_CACHE_DIR, "chiptemp.status")
+CHIPTEMP_POLL_INTERVAL = 5
+CHIPTEMP_PATTERN = re.compile(
+    r"^\s*\^?CHIPTEMP\s*:\s*([^\r\n]+)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+class _BelowWarningFilter(logging.Filter):
+    """Keep INFO/DEBUG on stdout so procd does not label them daemon.err."""
+    def filter(self, record):
+        return record.levelno < logging.WARNING
+
+
+logger = logging.getLogger(__name__)
+logger.handlers.clear()
+logger.propagate = False
+logger.setLevel(logging.WARNING)
+
+_log_formatter = logging.Formatter(
+    '%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger(__name__)
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setLevel(logging.DEBUG)
+_stdout_handler.addFilter(_BelowWarningFilter())
+_stdout_handler.setFormatter(_log_formatter)
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setLevel(logging.WARNING)
+_stderr_handler.setFormatter(_log_formatter)
+logger.addHandler(_stdout_handler)
+logger.addHandler(_stderr_handler)
 DEFAULT_CONFIG = {
     "AT_CONFIG": {
         "TYPE": "NETWORK",  # 可选值: "NETWORK" 或 "SERIAL"
@@ -60,8 +94,38 @@ DEFAULT_CONFIG = {
     },
     "TRAFFIC_CONFIG": {
         "ENABLED": True,
-        "PERSIST_INTERVAL": 5,
+        "POLL_INTERVAL": 5,
         "STATE_FILE": "/etc/at-webserver/traffic-stats.json"
+    },
+    "SCHEDULE_CONFIG": {
+        "ENABLED": False,
+        "CHECK_INTERVAL": 60,
+        "TIMEOUT": 180,
+        "UNLOCK_LTE": True,
+        "UNLOCK_NR": True,
+        "TOGGLE_AIRPLANE": True,
+        "NIGHT_ENABLED": True,
+        "NIGHT_START": "22:00",
+        "NIGHT_END": "06:00",
+        "NIGHT_LTE_TYPE": 3,
+        "NIGHT_LTE_BANDS": "",
+        "NIGHT_LTE_ARFCNS": "",
+        "NIGHT_LTE_PCIS": "",
+        "NIGHT_NR_TYPE": 3,
+        "NIGHT_NR_BANDS": "",
+        "NIGHT_NR_ARFCNS": "",
+        "NIGHT_NR_SCS_TYPES": "",
+        "NIGHT_NR_PCIS": "",
+        "DAY_ENABLED": True,
+        "DAY_LTE_TYPE": 3,
+        "DAY_LTE_BANDS": "",
+        "DAY_LTE_ARFCNS": "",
+        "DAY_LTE_PCIS": "",
+        "DAY_NR_TYPE": 3,
+        "DAY_NR_BANDS": "",
+        "DAY_NR_ARFCNS": "",
+        "DAY_NR_SCS_TYPES": "",
+        "DAY_NR_PCIS": ""
     }
 }
 
@@ -75,20 +139,35 @@ def deep_merge(default: dict, custom: dict) -> dict:
             result[key] = value
     return result
 
+
+def _uci_int(
+    values: dict,
+    key: str,
+    default: int,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    """读取有边界的 UCI 整数；单个坏值不得使整份配置回退。"""
+    raw_value = values.get(key, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        logger.warning("UCI 选项 %s=%r 不是整数，使用默认值 %d", key, raw_value, default)
+        return default
+
+    if minimum is not None and value < minimum:
+        logger.warning("UCI 选项 %s=%r 小于下限 %d，使用默认值 %d", key, raw_value, minimum, default)
+        return default
+    if maximum is not None and value > maximum:
+        logger.warning("UCI 选项 %s=%r 大于上限 %d，使用默认值 %d", key, raw_value, maximum, default)
+        return default
+    return value
+
 def load_config():
     """从 UCI 加载配置（优化版：一次性读取所有配置）"""
     import subprocess
-    
-    config = {
-        'AT_CONFIG': DEFAULT_CONFIG['AT_CONFIG'].copy(),
-        'NOTIFICATION_CONFIG': {
-            'WECHAT_WEBHOOK': '',
-            'LOG_FILE': '',
-            'NOTIFICATION_TYPES': DEFAULT_CONFIG['NOTIFICATION_CONFIG']['NOTIFICATION_TYPES'].copy()
-        },
-        'WEBSOCKET_CONFIG': DEFAULT_CONFIG['WEBSOCKET_CONFIG'].copy(),
-        'TRAFFIC_CONFIG': DEFAULT_CONFIG['TRAFFIC_CONFIG'].copy()
-    }
+
+    config = copy.deepcopy(DEFAULT_CONFIG)
     
     logger.info("开始从 UCI 加载配置...")
     
@@ -111,7 +190,10 @@ def load_config():
                     uci_data[short_key] = value.strip("'\"")
         
         # 读取连接类型
-        conn_type = uci_data.get('connection_type', 'NETWORK')
+        conn_type = uci_data.get('connection_type', 'NETWORK').upper()
+        if conn_type not in ('NETWORK', 'SERIAL'):
+            logger.warning("未知连接类型 %r，使用默认网络连接", conn_type)
+            conn_type = 'NETWORK'
         config['AT_CONFIG']['TYPE'] = conn_type
         
         logger.info(f"配置加载: 连接类型 = {conn_type}")
@@ -119,8 +201,8 @@ def load_config():
         # 读取网络配置（从 uci_data 字典读取，无需额外子进程）
         if conn_type == 'NETWORK':
             host = uci_data.get('network_host', '192.168.8.1')
-            port = int(uci_data.get('network_port', '20249'))
-            timeout = int(uci_data.get('network_timeout', '10'))
+            port = _uci_int(uci_data, 'network_port', 20249, 1, 65535)
+            timeout = _uci_int(uci_data, 'network_timeout', 10, 1, 3600)
             
             config['AT_CONFIG']['NETWORK']['HOST'] = host
             config['AT_CONFIG']['NETWORK']['PORT'] = port
@@ -135,8 +217,8 @@ def load_config():
             if port == 'custom':
                 port = uci_data.get('serial_port_custom', '/dev/ttyUSB0')
             
-            baudrate = int(uci_data.get('serial_baudrate', '115200'))
-            timeout = int(uci_data.get('serial_timeout', '10'))
+            baudrate = _uci_int(uci_data, 'serial_baudrate', 115200, 1, 4000000)
+            timeout = _uci_int(uci_data, 'serial_timeout', 10, 1, 3600)
             
             config['AT_CONFIG']['SERIAL']['PORT'] = port
             config['AT_CONFIG']['SERIAL']['BAUDRATE'] = baudrate
@@ -144,7 +226,7 @@ def load_config():
             logger.info(f"配置加载: 串口连接 {port} @ {baudrate} bps (超时: {timeout}秒)")
         
         # 读取 WebSocket 端口
-        ws_port = int(uci_data.get('websocket_port', '8765'))
+        ws_port = _uci_int(uci_data, 'websocket_port', 8765, 1, 65535)
         config['WEBSOCKET_CONFIG']['IPV4']['PORT'] = ws_port
         config['WEBSOCKET_CONFIG']['IPV6']['PORT'] = ws_port
         
@@ -160,15 +242,17 @@ def load_config():
         auth_key = uci_data.get('websocket_auth_key', '')
         config['WEBSOCKET_CONFIG']['AUTH_KEY'] = auth_key
 
-        # 流量统计持久化。默认每 5 秒主动查询并原子写入持久存储。
+        # 运行时只查询并更新内存；正常停止、重启或关机时才写入持久存储。
         traffic_enabled = uci_data.get('traffic_persist_enabled', '1') == '1'
-        traffic_interval = max(1, int(uci_data.get('traffic_persist_interval', '5')))
+        traffic_poll_interval = _uci_int(
+            uci_data, 'traffic_poll_interval', 5, 1, 3600
+        )
         traffic_state_file = uci_data.get(
             'traffic_state_file', '/etc/at-webserver/traffic-stats.json'
         )
         config['TRAFFIC_CONFIG'] = {
             'ENABLED': traffic_enabled,
-            'PERSIST_INTERVAL': traffic_interval,
+            'POLL_INTERVAL': traffic_poll_interval,
             'STATE_FILE': traffic_state_file
         }
         
@@ -208,8 +292,10 @@ def load_config():
         
         # 读取定时锁频配置（从字典读取，避免大量子进程调用）
         schedule_enabled = uci_data.get('schedule_enabled', '0') == '1'
-        check_interval = int(uci_data.get('schedule_check_interval', '60'))
-        timeout = int(uci_data.get('schedule_timeout', '180'))
+        check_interval = _uci_int(
+            uci_data, 'schedule_check_interval', 60, 1, 86400
+        )
+        timeout = _uci_int(uci_data, 'schedule_timeout', 180, 1, 86400)
         unlock_lte = uci_data.get('schedule_unlock_lte', '1') == '1'
         unlock_nr = uci_data.get('schedule_unlock_nr', '1') == '1'
         toggle_airplane = uci_data.get('schedule_toggle_airplane', '1') == '1'
@@ -220,13 +306,17 @@ def load_config():
         night_end = uci_data.get('schedule_night_end', '06:00')
         
         # 夜间 LTE 配置
-        night_lte_type = int(uci_data.get('schedule_night_lte_type', '3'))
+        night_lte_type = _uci_int(
+            uci_data, 'schedule_night_lte_type', 3, 0, 3
+        )
         night_lte_bands = uci_data.get('schedule_night_lte_bands', '')
         night_lte_arfcns = uci_data.get('schedule_night_lte_arfcns', '')
         night_lte_pcis = uci_data.get('schedule_night_lte_pcis', '')
         
         # 夜间 NR 配置
-        night_nr_type = int(uci_data.get('schedule_night_nr_type', '3'))
+        night_nr_type = _uci_int(
+            uci_data, 'schedule_night_nr_type', 3, 0, 3
+        )
         night_nr_bands = uci_data.get('schedule_night_nr_bands', '')
         night_nr_arfcns = uci_data.get('schedule_night_nr_arfcns', '')
         night_nr_scs_types = uci_data.get('schedule_night_nr_scs_types', '')
@@ -236,13 +326,17 @@ def load_config():
         day_enabled = uci_data.get('schedule_day_enabled', '1') == '1'
         
         # 日间 LTE 配置
-        day_lte_type = int(uci_data.get('schedule_day_lte_type', '3'))
+        day_lte_type = _uci_int(
+            uci_data, 'schedule_day_lte_type', 3, 0, 3
+        )
         day_lte_bands = uci_data.get('schedule_day_lte_bands', '')
         day_lte_arfcns = uci_data.get('schedule_day_lte_arfcns', '')
         day_lte_pcis = uci_data.get('schedule_day_lte_pcis', '')
         
         # 日间 NR 配置
-        day_nr_type = int(uci_data.get('schedule_day_nr_type', '3'))
+        day_nr_type = _uci_int(
+            uci_data, 'schedule_day_nr_type', 3, 0, 3
+        )
         day_nr_bands = uci_data.get('schedule_day_nr_bands', '')
         day_nr_arfcns = uci_data.get('schedule_day_nr_arfcns', '')
         day_nr_scs_types = uci_data.get('schedule_day_nr_scs_types', '')
@@ -290,50 +384,15 @@ def load_config():
         
     except Exception as e:
         logger.error(f"✗ 加载 UCI 配置失败: {e}，使用默认配置")
-        return {
-            'AT_CONFIG': DEFAULT_CONFIG['AT_CONFIG'],
-            'NOTIFICATION_CONFIG': DEFAULT_CONFIG['NOTIFICATION_CONFIG'],
-            'WEBSOCKET_CONFIG': DEFAULT_CONFIG['WEBSOCKET_CONFIG'],
-            'TRAFFIC_CONFIG': DEFAULT_CONFIG['TRAFFIC_CONFIG'],
-            'SCHEDULE_CONFIG': {
-                'ENABLED': False,
-                'CHECK_INTERVAL': 60,
-                'TIMEOUT': 180,
-                'UNLOCK_LTE': True,
-                'UNLOCK_NR': True,
-                'TOGGLE_AIRPLANE': True,
-                'NIGHT_ENABLED': True,
-                'NIGHT_START': '22:00',
-                'NIGHT_END': '06:00',
-                'NIGHT_LTE_BANDS': '',
-                'NIGHT_NR_BANDS': '',
-                'DAY_ENABLED': True,
-                'DAY_LTE_BANDS': '',
-                'DAY_NR_BANDS': ''
-            }
-        }
+        return copy.deepcopy(DEFAULT_CONFIG)
 
 # 加载配置
 config = load_config()
 AT_CONFIG = config['AT_CONFIG']
-NOTIFICATION_CONFIG = config.get('NOTIFICATION_CONFIG', DEFAULT_CONFIG['NOTIFICATION_CONFIG'])
-TRAFFIC_CONFIG = config.get('TRAFFIC_CONFIG', DEFAULT_CONFIG['TRAFFIC_CONFIG'])
-SCHEDULE_CONFIG = config.get('SCHEDULE_CONFIG', {
-    'ENABLED': False,
-    'CHECK_INTERVAL': 60,
-    'TIMEOUT': 180,
-    'UNLOCK_LTE': True,
-    'UNLOCK_NR': True,
-    'TOGGLE_AIRPLANE': True,
-    'NIGHT_ENABLED': True,
-    'NIGHT_START': '22:00',
-    'NIGHT_END': '06:00',
-    'NIGHT_LTE_BANDS': '',
-    'NIGHT_NR_BANDS': '',
-    'DAY_ENABLED': True,
-    'DAY_LTE_BANDS': '',
-    'DAY_NR_BANDS': ''
-})
+NOTIFICATION_CONFIG = config['NOTIFICATION_CONFIG']
+WEBSOCKET_CONFIG = config['WEBSOCKET_CONFIG']
+TRAFFIC_CONFIG = config['TRAFFIC_CONFIG']
+SCHEDULE_CONFIG = config['SCHEDULE_CONFIG']
 
 
 # ============= PDU 短信解码功能 =============
@@ -631,8 +690,7 @@ class WeChatNotification(NotificationChannel):
                 timeout = aiohttp.ClientTimeout(total=5)
                 connector = aiohttp.TCPConnector(
                     force_close=True,
-                    enable_cleanup_closed=True,
-                    ssl=False
+                    enable_cleanup_closed=True
                 )
                 
                 async with aiohttp.ClientSession(
@@ -1811,7 +1869,17 @@ class ATConnection(ABC):
         """接收数据"""
         pass
 
-    async def send_command(self, command: str) -> bytearray:
+    async def receive_unsolicited(self, size: int) -> bytes:
+        """在没有 AT 命令占用连接时读取主动上报数据。"""
+        if self._command_lock.locked():
+            return b""
+
+        async with self._command_lock:
+            if not self.is_connected:
+                return b""
+            return await self.receive(size)
+
+    async def send_command(self, command: str, report_error: bool = True) -> bytearray:
         """发送AT命令"""
         try:
             if not self.is_connected:
@@ -1832,7 +1900,10 @@ class ATConnection(ABC):
                 self._response_buffer.clear()
                 
                 # 发送命令
-                await self.send(command.encode())
+                payload = command.encode()
+                sent = await self.send(payload)
+                if sent != len(payload):
+                    raise ConnectionError("AT命令未完整发送")
                 self._last_command_time = time.time()
 
                 # 等待响应（优化：限制最大缓冲区，防止内存泄漏）
@@ -1877,7 +1948,10 @@ class ATConnection(ABC):
             raise  # 向上传播 KeyboardInterrupt
         except Exception as e:
             self.is_connected = False
-            logger.error(f"命令发送失败: {e}")
+            if report_error:
+                logger.error(f"命令发送失败: {e}")
+            else:
+                logger.debug(f"启动探测尚未就绪: {e}")
             await asyncio.sleep(1)
             return bytearray()
 
@@ -1894,23 +1968,40 @@ class NetworkATConnection(ATConnection):
 
     @handle_connection_error
     async def connect(self) -> bool:
-        try:
-            if self.socket:
+        async with self._command_lock:
+            if self.is_connected and self.socket:
+                return True
+
+            old_socket = self.socket
+            self.socket = None
+            self.is_connected = False
+            if old_socket:
                 try:
-                    self.socket.close()
-                except:
+                    old_socket.close()
+                except OSError:
                     pass
-            
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(self.timeout)
-            self.socket.connect((self.host, self.port))
-            self.socket.setblocking(False)
+
+            new_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            new_socket.setblocking(False)
+            try:
+                await asyncio.wait_for(
+                    asyncio.get_running_loop().sock_connect(
+                        new_socket, (self.host, self.port)
+                    ),
+                    timeout=self.timeout
+                )
+            except asyncio.CancelledError:
+                new_socket.close()
+                raise
+            except (asyncio.TimeoutError, OSError) as e:
+                new_socket.close()
+                logger.warning(f"网络AT连接失败: {e}")
+                return False
+
+            self.socket = new_socket
             self.is_connected = True
             logger.info(f"已连接到网络AT {self.host}:{self.port}")
             return True
-        except Exception as e:
-            logger.warning(f"网络AT连接失败: {e}")
-            return False
 
     @handle_connection_error
     async def close(self):
@@ -1921,21 +2012,38 @@ class NetworkATConnection(ATConnection):
 
     @handle_connection_error
     async def send(self, data: bytes) -> int:
-        if not self.socket:
+        sock = self.socket
+        if not sock:
             raise ConnectionError("未连接")
-        return self.socket.send(data)
+        try:
+            await asyncio.get_running_loop().sock_sendall(sock, data)
+            return len(data)
+        except OSError as e:
+            self.is_connected = False
+            raise ConnectionError(f"网络AT发送失败: {e}") from e
 
     @handle_connection_error
     async def receive(self, size: int) -> bytes:
-        if not self.socket:
+        sock = self.socket
+        if not sock:
             raise ConnectionError("未连接")
         try:
-            self.socket.settimeout(0.1)
-            return self.socket.recv(size)
-        except (socket.timeout, BlockingIOError):
+            data = await asyncio.wait_for(
+                asyncio.get_running_loop().sock_recv(sock, size),
+                timeout=0.1
+            )
+        except asyncio.TimeoutError:
             return b""
+        except OSError as e:
+            self.is_connected = False
+            raise ConnectionError(f"网络AT接收失败: {e}") from e
         except KeyboardInterrupt:
             raise  # 直接向上传播，让上层处理
+
+        if data == b"":
+            self.is_connected = False
+            raise ConnectionError("网络AT连接已关闭")
+        return data
 
 class SerialATConnection(ATConnection):
     """串口AT连接实现"""
@@ -2238,15 +2346,67 @@ class WebSocketServer:
         self.at_client = at_client
         self.traffic_store = traffic_store
         self._active_connections = set()
+        self._active_owner = None
+        self._owner_lock = asyncio.Lock()
         self._heartbeat_interval = 30  # 心跳间隔30秒
         logger.info("WebSocket服务器已初始化")
+
+    @staticmethod
+    def _origin_is_allowed(origin: Optional[str], host: Optional[str]) -> bool:
+        """浏览器 Origin 必须与 WebSocket 握手 Host 使用同一主机。"""
+        if not origin:
+            return True
+        try:
+            origin_url = urlsplit(origin)
+            host_url = urlsplit('//' + (host or ''))
+            origin_host = (origin_url.hostname or '').rstrip('.').lower()
+            request_host = (host_url.hostname or '').rstrip('.').lower()
+        except ValueError:
+            return False
+        return (
+            origin_url.scheme in ('http', 'https') and
+            bool(origin_host) and
+            bool(request_host) and
+            origin_host == request_host
+        )
 
     async def _send_heartbeat(self, websocket):
         """发送心跳包"""
         try:
             await websocket.send('ping')
-        except:
+        except Exception:
+            await self._release_owner(websocket)
+
+    async def _claim_latest_owner(self, websocket):
+        """Atomically make websocket the only browser owner.
+
+        This hand-off deliberately affects browser WebSockets only.  The AT
+        client and all modem/background tasks remain alive in the daemon.
+        """
+        async with self._owner_lock:
+            replaced = tuple(
+                connection
+                for connection in self._active_connections
+                if connection is not websocket
+            )
+            self._active_owner = websocket
+            self._active_connections = {websocket}
+
+        for connection in replaced:
+            try:
+                await connection.close(
+                    code=4001,
+                    reason='replaced_by_new_session',
+                )
+            except Exception as exc:
+                logger.debug(f"关闭已被接管的WebSocket连接失败: {exc}")
+
+    async def _release_owner(self, websocket):
+        """Release websocket without allowing an old session to clear a new one."""
+        async with self._owner_lock:
             self._active_connections.discard(websocket)
+            if self._active_owner is websocket:
+                self._active_owner = None
 
     async def _process_command(self, command: str) -> ATResponse:
         """处理AT命令"""
@@ -2281,6 +2441,9 @@ class WebSocketServer:
                             if line and line.strip() != command.strip()]
             filtered_response = '\r\n'.join(response_lines)
 
+            if not filtered_response.strip():
+                return ATResponse(False, None, "未收到响应")
+
             command_success = 'ERROR' not in filtered_response.upper()
             if command_success and command_name == 'AT^DSFLOWQRY':
                 filtered_response = self.traffic_store.rewrite_query_response(filtered_response)
@@ -2305,6 +2468,19 @@ class WebSocketServer:
 
     async def handle_client(self, websocket, path=None):
         """处理WebSocket客户端连接"""
+        # 浏览器只允许与握手 Host 同主机的页面建立连接，阻断跨站网页直接下发 AT 命令。
+        try:
+            origin = websocket.request_headers.get('Origin')
+            host = websocket.request_headers.get('Host')
+            if not self._origin_is_allowed(origin, host):
+                await websocket.close(code=1008, reason='Origin not allowed')
+                logger.warning("WebSocket连接被拒绝: Origin 与 Host 不匹配")
+                return
+        except Exception as e:
+            await websocket.close(code=1008, reason='Invalid Origin')
+            logger.warning(f"WebSocket连接被拒绝: Origin 校验失败: {e}")
+            return
+
         auth_key = WEBSOCKET_CONFIG.get('AUTH_KEY', '')
         
         # 如果配置了密钥，需要先验证
@@ -2353,7 +2529,10 @@ class WebSocketServer:
                 await websocket.close()
                 return
         
-        self._active_connections.add(websocket)
+        # Origin and optional authentication have both succeeded.  Only now may
+        # this browser replace the current owner; rejected clients cannot steal
+        # an authenticated session.
+        await self._claim_latest_owner(websocket)
         logger.debug("新的WebSocket客户端已连接")
         
         # 启动心跳检测
@@ -2363,6 +2542,12 @@ class WebSocketServer:
             while True:
                 try:
                     command = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    if self._active_owner is not websocket:
+                        await websocket.close(
+                            code=4001,
+                            reason='replaced_by_new_session',
+                        )
+                        break
                     if command == 'ping':
                         await websocket.send('pong')
                         continue
@@ -2383,7 +2568,7 @@ class WebSocketServer:
                     
         finally:
             heartbeat_task.cancel()
-            self._active_connections.discard(websocket)
+            await self._release_owner(websocket)
             logger.debug("WebSocket客户端连接已清理")
 
     async def _heartbeat_loop(self, websocket):
@@ -2398,27 +2583,289 @@ class WebSocketServer:
                 break
 
     async def broadcast(self, message: dict):
-        """向所有连接的客户端广播消息（优化：自动清理断开的连接）"""
-        if not self._active_connections:
-            return
-        
-        # 清理断开的连接（防止内存泄漏）
-        dead_connections = set()
-        for websocket in self._active_connections.copy():
+        """Send a daemon event only to the latest browser owner."""
+        # Keep selection, liveness check and send in the same critical section.
+        # A concurrent takeover is therefore ordered wholly before or after the
+        # event, never midway through a send to the replaced page.
+        async with self._owner_lock:
+            websocket = self._active_owner
+            if websocket is None:
+                return
+
             try:
-                # 检查连接是否仍然活跃
                 if websocket.closed:
-                    dead_connections.add(websocket)
-                    continue
+                    self._active_connections.discard(websocket)
+                    if self._active_owner is websocket:
+                        self._active_owner = None
+                    return
                 await websocket.send(json.dumps(message))
             except Exception as e:
                 logger.debug(f"广播消息失败，移除连接: {e}")
-                dead_connections.add(websocket)
-        
-        # 批量移除失效连接
-        if dead_connections:
-            self._active_connections -= dead_connections
-            logger.debug(f"清理了 {len(dead_connections)} 个断开的 WebSocket 连接")
+                self._active_connections.discard(websocket)
+                if self._active_owner is websocket:
+                    self._active_owner = None
+
+
+async def collect_traffic_sample(
+    client: ATClient,
+    traffic_store: TrafficStatsStore,
+    timeout: Optional[float] = None,
+) -> bool:
+    """读取一次模组计数并只更新内存累计值。"""
+    if not traffic_store.enabled or not client.is_connected:
+        return False
+
+    command = client.send_command("AT^DSFLOWQRY\r")
+    response = (
+        await asyncio.wait_for(command, timeout=timeout)
+        if timeout is not None else await command
+    )
+    if isinstance(response, (bytes, bytearray)):
+        response_text = response.decode('ascii', errors='ignore')
+    elif isinstance(response, str):
+        response_text = response
+    else:
+        return False
+
+    if (
+        not response_text.strip()
+        or 'ERROR' in response_text.upper()
+        or not TrafficStatsStore.DSFLOW_PATTERN.search(response_text)
+    ):
+        return False
+
+    traffic_store.rewrite_query_response(response_text)
+    return True
+
+
+def parse_mt5700_chiptemp(response) -> Optional[int]:
+    """Return the hottest valid MT5700 sensor in integer millidegrees C."""
+    if isinstance(response, (bytes, bytearray)):
+        response_text = response.decode('ascii', errors='ignore')
+    elif isinstance(response, str):
+        response_text = response
+    else:
+        return None
+
+    match = CHIPTEMP_PATTERN.search(response_text[:4096])
+    if not match:
+        return None
+
+    fields = match.group(1).split(',')
+    if len(fields) < 12:
+        return None
+
+    temperatures = []
+    for raw_field in fields[:12]:
+        field = raw_field.strip()
+        if not re.fullmatch(r"[+-]?\d{1,6}", field):
+            continue
+        raw_value = int(field, 10)
+        # MT5700 reports tenths of a degree. 65535 and values above 1500
+        # are firmware sentinels, matching the modem WebUI's parser.
+        if raw_value < -400 or raw_value > 1500 or raw_value >= 65535:
+            continue
+        temperatures.append(raw_value * 100)
+
+    return max(temperatures) if temperatures else None
+
+
+def _read_uptime_seconds() -> Optional[int]:
+    try:
+        with open('/proc/uptime', 'r', encoding='ascii') as handle:
+            raw_value = handle.read(64).split(None, 1)[0]
+        value = float(raw_value)
+    except (OSError, ValueError, IndexError):
+        return None
+    if value < 0:
+        return None
+    return int(value)
+
+
+def _ensure_private_runtime_directory(path: str) -> bool:
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            return False
+        os.chmod(path, 0o700)
+        return True
+    except OSError:
+        return False
+
+
+def write_chiptemp_cache(
+    temp_mc: int,
+    sample_uptime: Optional[int] = None,
+    cache_file: str = CHIPTEMP_CACHE_FILE,
+) -> bool:
+    """Atomically publish a root-only tmpfs temperature snapshot."""
+    if not isinstance(temp_mc, int) or temp_mc < -40000 or temp_mc > 150000:
+        return False
+    if sample_uptime is None:
+        sample_uptime = _read_uptime_seconds()
+    if not isinstance(sample_uptime, int) or sample_uptime < 0:
+        return False
+
+    cache_dir = os.path.dirname(cache_file)
+    if not _ensure_private_runtime_directory(cache_dir):
+        return False
+
+    temporary = f"{cache_file}.tmp.{os.getpid()}"
+    payload = (
+        "version=1\n"
+        f"temp_mc={temp_mc}\n"
+        f"sample_uptime={sample_uptime}\n"
+    ).encode('ascii')
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, 'O_NOFOLLOW'):
+        flags |= os.O_NOFOLLOW
+    descriptor = None
+    try:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, 'wb') as handle:
+            descriptor = None
+            handle.write(payload)
+            handle.flush()
+        os.replace(temporary, cache_file)
+        os.chmod(cache_file, 0o600)
+        return True
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
+def remove_chiptemp_cache(cache_file: str = CHIPTEMP_CACHE_FILE) -> None:
+    try:
+        os.unlink(cache_file)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("清理 MT5700 温度缓存失败: %s", exc)
+
+
+async def collect_chiptemp_sample(
+    client: ATClient,
+    cache_file: str = CHIPTEMP_CACHE_FILE,
+) -> bool:
+    """Query through at-server's shared AT lock and update only tmpfs."""
+    if not client.is_connected or not _is_managed_r3mini_mt5700_serial():
+        return False
+
+    # Do not wrap send_command() in an outer wait_for().  send_command() has
+    # its own bounded response timeout and owns the shared AT command lock.
+    # Cancelling it after the command has been transmitted could leave a late
+    # modem response queued for the next WebSocket or background command.
+    response = await client.send_command("AT^CHIPTEMP?\r")
+    temperature = parse_mt5700_chiptemp(response)
+    if temperature is None:
+        return False
+    return write_chiptemp_cache(temperature, cache_file=cache_file)
+
+
+async def persist_traffic_on_shutdown(
+    client: ATClient,
+    traffic_store: TrafficStatsStore,
+    query_timeout: float = 3.0,
+) -> bool:
+    """正常退出时最后采样并将内存累计值原子固化一次。"""
+    if not traffic_store.enabled:
+        return False
+
+    if client.is_connected:
+        try:
+            if await collect_traffic_sample(client, traffic_store, query_timeout):
+                logger.info("✓ 已完成停止前的最后一次流量采样")
+            else:
+                logger.warning("停止前流量采样未返回有效数据，保存最后已知内存值")
+        except Exception as exc:
+            logger.warning("停止前流量采样失败，保存最后已知内存值: %s", exc)
+    else:
+        logger.warning("AT 连接已断开，保存最后已知内存流量值")
+
+    try:
+        written = traffic_store.flush(force=True)
+        if written:
+            logger.info("✓ 流量统计已原子固化到持久存储")
+        else:
+            logger.info("没有可固化的流量统计")
+        return written
+    except Exception as exc:
+        logger.error("停止时固化流量统计失败: %s", exc)
+        return False
+
+def _read_small_text(path: str) -> str:
+    try:
+        with open(path, 'r', encoding='ascii', errors='ignore') as handle:
+            return handle.read(256).strip()
+    except OSError:
+        return ''
+
+
+def _tty_has_usb_parent(tty_port: str, vendor: str, product: str) -> bool:
+    tty_name = os.path.basename(tty_port)
+    path = os.path.realpath(f'/sys/class/tty/{tty_name}/device')
+    if not path or path == f'/sys/class/tty/{tty_name}/device':
+        return False
+
+    while path and path != os.path.dirname(path):
+        if (_read_small_text(os.path.join(path, 'idVendor')).lower() == vendor and
+                _read_small_text(os.path.join(path, 'idProduct')).lower() == product):
+            return True
+        path = os.path.dirname(path)
+    return False
+
+
+def _is_managed_r3mini_mt5700_serial() -> bool:
+    if AT_CONFIG.get('TYPE') != 'SERIAL':
+        return False
+    if AT_CONFIG.get('SERIAL', {}).get('PORT') != '/dev/ttyUSB1':
+        return False
+    if _read_small_text('/tmp/sysinfo/board_name').lower() != 'bananapi,bpi-r3mini-emmc':
+        return False
+    return _tty_has_usb_parent('/dev/ttyUSB1', '3466', '3301')
+
+
+def _sendat_cfun_enabled() -> bool:
+    return (os.path.isfile('/etc/init.d/sendat-cfun') and
+            bool(glob.glob('/etc/rc.d/S*sendat-cfun')))
+
+
+async def wait_for_managed_mt5700_startup(client, marker_timeout=150, probe_timeout=30):
+    """Avoid racing luci-app-modem's one-shot CFUN cycle on the R3 Mini."""
+    if not _is_managed_r3mini_mt5700_serial() or not _sendat_cfun_enabled():
+        return
+
+    marker = '/tmp/sendat-cfun.ready'
+    deadline = time.monotonic() + marker_timeout
+    logger.info("等待 luci-app-modem 完成 MT5700 启动初始化...")
+    while not os.path.exists(marker):
+        if time.monotonic() >= deadline:
+            logger.warning("等待 sendat-cfun 完成标记超时，转入 AT 就绪探测")
+            break
+        await asyncio.sleep(0.5)
+
+    deadline = time.monotonic() + probe_timeout
+    while time.monotonic() < deadline:
+        response = await client.connection.send_command('AT', report_error=False)
+        if b'OK' in response:
+            logger.info("MT5700 启动初始化已结束，AT 通道可用")
+            return
+        await client.connection.close()
+        await asyncio.sleep(1)
+
+    logger.warning("MT5700 启动探测未在限定时间内收到 OK，交由常规重连流程处理")
+
 
 async def main():
     """主函数"""
@@ -2434,13 +2881,14 @@ async def main():
     logger.info("=" * 60)
     
     # 重新加载配置（确保使用最新配置）
-    global config, AT_CONFIG, NOTIFICATION_CONFIG, WEBSOCKET_CONFIG, TRAFFIC_CONFIG
+    global config, AT_CONFIG, NOTIFICATION_CONFIG, WEBSOCKET_CONFIG, TRAFFIC_CONFIG, SCHEDULE_CONFIG
     logger.info("正在重新加载配置...")
     config = load_config()
     AT_CONFIG = config['AT_CONFIG']
     NOTIFICATION_CONFIG = config['NOTIFICATION_CONFIG']
     WEBSOCKET_CONFIG = config['WEBSOCKET_CONFIG']
     TRAFFIC_CONFIG = config['TRAFFIC_CONFIG']
+    SCHEDULE_CONFIG = config['SCHEDULE_CONFIG']
     logger.info("✓ 配置重新加载完成")
     
     # 打印运行配置信息
@@ -2463,7 +2911,8 @@ async def main():
 
     logger.info(f"\n流量统计持久化:")
     logger.info(f"  状态: {'启用' if TRAFFIC_CONFIG['ENABLED'] else '禁用'}")
-    logger.info(f"  保存间隔: {TRAFFIC_CONFIG['PERSIST_INTERVAL']}秒")
+    logger.info(f"  内存采集间隔: {TRAFFIC_CONFIG['POLL_INTERVAL']}秒")
+    logger.info("  落盘策略: 正常停止、重启或关机时固化一次")
     logger.info(f"  状态文件: {TRAFFIC_CONFIG['STATE_FILE']}")
     
     logger.info(f"\n通知配置:")
@@ -2492,12 +2941,31 @@ async def main():
     monitor_tasks = []
     server_v4 = None
     server_v6 = None
-    
-    # 启动通知管理器
-    logger.info("正在启动通知管理器...")
-    await client.notification_manager.start()
-    logger.info("✓ 通知管理器已启动")
-    
+    notification_started = False
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    shutdown_event = asyncio.Event()
+    registered_signals = []
+
+    def request_shutdown(received_signal):
+        """信号处理器只触发协程取消，实际 I/O 统一在 finally 中执行。"""
+        if shutdown_event.is_set():
+            return
+        shutdown_event.set()
+        logger.warning(f"收到停止信号 {received_signal}，准备固化流量统计")
+        if main_task and not main_task.done():
+            main_task.cancel()
+
+    if sys.platform != 'win32':
+        for handled_signal in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(
+                    handled_signal, request_shutdown, handled_signal
+                )
+                registered_signals.append(handled_signal)
+            except (NotImplementedError, RuntimeError):
+                logger.warning(f"无法注册停止信号处理器: {handled_signal}")
+
     async def connection_monitor():
         """连接监控任务"""
         while True:
@@ -2525,11 +2993,9 @@ async def main():
                         # 检查socket是否存在且已连接
                         if (isinstance(client.connection, NetworkATConnection) and 
                             client.connection.socket and 
-                            client.is_connected and
-                            not client.connection._command_lock.locked()):
-                            # 优化：增加超时时间，减少忙等待（0.1s -> 0.2s）
-                            client.connection.socket.settimeout(0.2)
-                            data = client.connection.socket.recv(4096)
+                            client.is_connected):
+                            # 与 AT 命令共用读取锁，避免监控任务吞掉命令响应。
+                            data = await client.connection.receive_unsolicited(4096)
                             if data:
                                 line = data.decode('ascii', errors='ignore').strip()
                                 if line:
@@ -2540,8 +3006,6 @@ async def main():
                                         "type": "raw_data",
                                         "data": line
                                     })
-                    except (socket.timeout, BlockingIOError):
-                        pass  # 正常的超时，继续循环
                     except KeyboardInterrupt:
                         logger.info("正在关闭socket监控...")
                         return
@@ -2580,28 +3044,48 @@ async def main():
                 await asyncio.sleep(1)
 
     async def traffic_stats_monitor():
-        """即使没有浏览器连接，也持续采集并固化模组累计流量。"""
-        interval = TRAFFIC_CONFIG['PERSIST_INTERVAL']
+        """持续采集到内存，识别模组计数器复位，但运行时不写持久存储。"""
+        interval = TRAFFIC_CONFIG['POLL_INTERVAL']
         while True:
             try:
-                if client.is_connected:
-                    response = await client.send_command("AT^DSFLOWQRY\r")
-                    response_text = response.decode('ascii', errors='ignore')
-                    if response_text and 'ERROR' not in response_text.upper():
-                        traffic_store.rewrite_query_response(response_text)
-                        traffic_store.flush()
+                await collect_traffic_sample(client, traffic_store)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"流量统计固化失败，将在 {interval} 秒后重试: {e}")
+                logger.warning(f"流量统计内存采集失败，将在 {interval} 秒后重试: {e}")
 
             try:
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
 
+    async def chiptemp_monitor():
+        """Cache MT5700 temperature without exposing or competing for ttyUSB1."""
+        remove_chiptemp_cache()
+        while True:
+            try:
+                if client.is_connected:
+                    updated = await collect_chiptemp_sample(client)
+                    if not updated:
+                        logger.debug("MT5700 温度查询未返回有效数据")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("MT5700 温度缓存刷新失败: %s", exc)
+
+            try:
+                await asyncio.sleep(CHIPTEMP_POLL_INTERVAL)
+            except asyncio.CancelledError:
+                break
+
     try:
+        logger.info("正在启动通知管理器...")
+        await client.notification_manager.start()
+        notification_started = True
+        logger.info("✓ 通知管理器已启动")
+
         logger.info("正在连接到 AT 设备...")
+        await wait_for_managed_mt5700_startup(client)
         await client.connect()
         logger.info("✓ AT 设备连接成功")
         
@@ -2614,6 +3098,8 @@ async def main():
         ]
         if traffic_store.enabled:
             monitor_tasks.append(asyncio.create_task(traffic_stats_monitor()))
+        if _is_managed_r3mini_mt5700_serial():
+            monitor_tasks.append(asyncio.create_task(chiptemp_monitor()))
         logger.info("✓ 监控任务已启动")
         
         # 启动WebSocket服务器
@@ -2644,15 +3130,11 @@ async def main():
         logger.info("=" * 60)
         
         # 启动完成，降低日志级别，只记录警告和错误
+        logger.info("启动完成，后续仅记录 WARNING/ERROR")
         logger.setLevel(logging.WARNING)
-        logger.warning("日志级别已切换为 WARNING，仅记录警告和错误")
         
-        # 等待服务器关闭
-        await asyncio.gather(
-            server_v4.wait_closed(),
-            server_v6.wait_closed(),
-            *monitor_tasks
-        )
+        # 等待 SIGTERM/SIGINT；信号处理器会取消本任务以中断启动或重连阶段。
+        await shutdown_event.wait()
         
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass  # 静默处理，交给外层统一处理
@@ -2660,48 +3142,69 @@ async def main():
         logger.error(f"运行错误: {e}")
         raise
     finally:
+        logger.setLevel(logging.INFO)
         logger.info("="*60)
         logger.info("正在关闭服务...")
         logger.info("="*60)
-        
-        # 停止通知管理器
-        logger.info("正在停止通知管理器...")
-        await client.notification_manager.stop()
-        logger.info("✓ 通知管理器已停止")
-        
-        # 清理资源
+
+        # 先停止接收新 WebSocket 请求，避免与最后一次 AT 查询竞争。
+        if server_v4 or server_v6:
+            logger.info("正在关闭 WebSocket 服务器...")
+            try:
+                if server_v4:
+                    server_v4.close()
+                if server_v6:
+                    server_v6.close()
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        server_v4.wait_closed() if server_v4 else asyncio.sleep(0),
+                        server_v6.wait_closed() if server_v6 else asyncio.sleep(0)
+                    ),
+                    timeout=2.0
+                )
+                logger.info("✓ WebSocket 服务器已关闭")
+            except Exception as e:
+                logger.warning(f"关闭 WebSocket 服务器超时或失败: {e}")
+
+        # 停止后台采样与连接监控，释放 AT 命令锁。
         logger.info("正在清理监控任务...")
         for task in monitor_tasks:
             task.cancel()
         try:
             await asyncio.gather(*monitor_tasks, return_exceptions=True)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"清理监控任务失败: {e}")
         logger.info("✓ 监控任务已清理")
+        remove_chiptemp_cache()
 
-        # 正常停止时再做一次同步；意外断电最多损失一个配置间隔内的数据。
-        traffic_store.flush(force=True)
-            
-        if server_v4 or server_v6:
-            logger.info("正在关闭 WebSocket 服务器...")
-            if server_v4:
-                server_v4.close()
-            if server_v6:
-                server_v6.close()
-            
+        # 只对 SIGTERM/SIGINT 触发的正常停止执行落盘。启动失败或异常崩溃
+        # 可能被 procd 快速反复拉起，不能在该循环中持续重写 eMMC。
+        if shutdown_event.is_set():
+            await persist_traffic_on_shutdown(client, traffic_store)
+        else:
+            logger.warning("服务异常退出，跳过流量落盘以避免 respawn 写入循环")
+
+        if notification_started:
+            logger.info("正在停止通知管理器...")
             try:
-                await asyncio.gather(
-                    server_v4.wait_closed() if server_v4 else asyncio.sleep(0),
-                    server_v6.wait_closed() if server_v6 else asyncio.sleep(0)
-                )
-            except:
-                pass
-            logger.info("✓ WebSocket 服务器已关闭")
-        
+                await client.notification_manager.stop()
+                logger.info("✓ 通知管理器已停止")
+            except Exception as e:
+                logger.warning(f"停止通知管理器失败: {e}")
+
         logger.info("正在关闭 AT 连接...")
-        await client.close()
-        logger.info("✓ AT 连接已关闭")
-        
+        try:
+            await client.close()
+            logger.info("✓ AT 连接已关闭")
+        except Exception as e:
+            logger.warning(f"关闭 AT 连接失败: {e}")
+
+        for handled_signal in registered_signals:
+            try:
+                loop.remove_signal_handler(handled_signal)
+            except Exception:
+                pass
+
         logger.info("="*60)
         logger.info("服务已完全停止")
         logger.info("="*60)

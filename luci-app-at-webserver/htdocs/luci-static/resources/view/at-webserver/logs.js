@@ -29,19 +29,21 @@ return view.extend({
 	},
 
 	handleClearLog: function(ev) {
-		// 通过 HTTP 请求调用 CGI 脚本清空日志
-		return L.Request.get('/cgi-bin/at-log-clear').then(function(res) {
-			try {
-				var result = res.json();
-				if (result.success) {
-					ui.addNotification(null, E('p', _('✓ 通知日志已清空')), 'success');
-					setTimeout(function() { window.location.reload(); }, 600);
-				} else {
-					ui.addNotification(null, E('p', _('清空失败: %s').format(result.error || '未知错误')), 'error');
-				}
-			} catch(e) {
-				ui.addNotification(null, E('p', _('清空失败: 解析响应出错')), 'error');
-			}
+		var logFile = uci.get('at-webserver', 'config', 'log_file') || '';
+
+		if (!logFile) {
+			ui.addNotification(null, E('p', _('清空失败: 未配置日志文件')), 'error');
+			return Promise.resolve();
+		}
+		if (logFile !== '/tmp/at-notifications.log' && logFile !== '/var/log/at-notifications.log') {
+			ui.addNotification(null, E('p', _('清空失败: 不支持的日志文件路径')), 'error');
+			return Promise.resolve();
+		}
+
+		// 通过已认证的 LuCI rpcd 文件接口清空日志，避免暴露公开 CGI 写入口。
+		return fs.write(logFile, '').then(function() {
+			ui.addNotification(null, E('p', _('✓ 通知日志已清空')), 'success');
+			setTimeout(function() { window.location.reload(); }, 600);
 		}).catch(function(err) {
 			ui.addNotification(null, E('p', _('清空失败: %s').format(err.message || '请求失败')), 'error');
 		});
@@ -71,7 +73,7 @@ return view.extend({
 						E('p', {}, _('请先在配置页面中设置日志文件路径，例如：/var/log/at-notifications.log')),
 						E('p', {}, [
 							E('a', { 
-								'href': L.url('admin/modem/tdtech/config'),
+								'href': L.url('admin/services/at-webserver/config'),
 								'class': 'btn cbi-button-apply'
 							}, _('前往配置'))
 						])

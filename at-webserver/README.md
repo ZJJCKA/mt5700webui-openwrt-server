@@ -1,6 +1,6 @@
 # AT WebServer 软件包
 
-这个软件包为 NRadio C8 提供了一个 WebSocket AT 命令服务器和 Web 界面。
+这个软件包为 MT5700 提供了一个 WebSocket AT 命令服务器和 Web 界面。
 
 ## 📁 文件结构
 
@@ -33,9 +33,9 @@ uci set at-webserver.config.serial_baudrate='115200'
 # WebSocket 端口
 uci set at-webserver.config.websocket_port='8765'
 
-# 流量统计持久化（默认启用，每5秒固化一次）
+# 流量统计（默认每 5 秒采样到内存，仅在正常停止/重启时固化）
 uci set at-webserver.config.traffic_persist_enabled='1'
-uci set at-webserver.config.traffic_persist_interval='5'
+uci set at-webserver.config.traffic_poll_interval='5'
 
 # 通知配置
 uci set at-webserver.config.wechat_webhook='https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY'
@@ -53,6 +53,8 @@ uci commit at-webserver
 # 重启服务
 /etc/init.d/at-webserver restart
 ```
+
+运行期间的周期采样不会写入 `/etc`。服务正常停止、重启或系统正常重启/关机时，会最后采样并原子固化一次；下一次启动从该快照恢复后继续累计。WebUI 主动清零会立即固化清零结果，防止旧累计在异常断电后恢复。突然断电、服务异常崩溃、内核崩溃或 `kill -9` 不执行正常退出固化，本次开机尚未固化的增量可能丢失；这样也可避免 procd 启动失败循环反复写入 eMMC。
 
 ## 🚀 使用
 
@@ -89,7 +91,7 @@ logread | grep at-server
 
 如果你有自定义的前端文件，放在：
 ```
-package/nradio/at-webserver/files/www/
+package/mt5700webui-openwrt-server/at-webserver/files/www/
 ```
 
 编译后会自动安装到路由器的 `/www/5700/` 目录，访问地址为 `http://路由器IP/5700/`
@@ -101,6 +103,7 @@ package/nradio/at-webserver/files/www/
 - python3-websockets
 - python3-pyserial
 - python3-aiohttp (用于企业微信通知)
+- ca-bundle (校验企业微信 HTTPS 证书)
 
 这些依赖会在安装时自动安装。
 
@@ -144,4 +147,3 @@ RSRP: -75 dBm
 RSRQ: -10 dB
 SINR: 20 dB
 ```
-

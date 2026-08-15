@@ -27,16 +27,13 @@ return view.extend({
 
 		var wsPort = uci.get('at-webserver', 'config', 'websocket_port') || '8765';
 		var wsAuthKey = uci.get('at-webserver', 'config', 'websocket_auth_key') || '';
+		if (!/^\d+$/.test(wsPort) || Number(wsPort) < 1 || Number(wsPort) > 65535)
+			wsPort = '8765';
 		var wsUrl = 'ws://' + window.location.hostname + ':' + wsPort;
-		
-		// 安全处理：转义 JavaScript 字符串中的特殊字符
-		var wsAuthKeyEscaped = wsAuthKey
-			.replace(/\\/g, '\\\\')   // 反斜杠
-			.replace(/'/g, "\\'")      // 单引号
-			.replace(/"/g, '\\"')      // 双引号
-			.replace(/\n/g, '\\n')     // 换行
-			.replace(/\r/g, '\\r')     // 回车
-			.replace(/\t/g, '\\t');    // 制表符
+		var wsAuthKeyJson = JSON.stringify(wsAuthKey)
+			.replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+		var wsUrlJson = JSON.stringify(wsUrl)
+			.replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 
 		var view = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, _('AT 命令调试')),
@@ -85,7 +82,7 @@ return view.extend({
 						E('p', {}, _('服务未运行，请先启动 AT WebServer 服务')),
 						E('p', {}, [
 							E('a', { 
-								'href': L.url('admin/modem/tdtech/config'),
+								'href': L.url('admin/services/at-webserver/config'),
 								'class': 'btn cbi-button-apply'
 							}, _('前往配置'))
 						])
@@ -171,7 +168,8 @@ return view.extend({
 	var reconnectTimer = null;
 	var isManualClose = false;
 	var isAuthenticated = false;
-	var authKey = '${wsAuthKeyEscaped}';
+	var authKey = ${wsAuthKeyJson};
+	var wsUrl = ${wsUrlJson};
 	
 	var statusEl = document.getElementById('connection-status');
 	var outputEl = document.getElementById('at-output');
@@ -188,13 +186,21 @@ return view.extend({
 		            type === 'recv' ? '<<< ' :
 		            type === 'error' ? '[!] ' : '[i] ';
 		
-		outputEl.innerHTML += '<span style="color: #858585;">[' + timestamp + ']</span> ' +
-		                      '<span style="color: ' + color + ';">' + prefix + text + '</span>\\n';
+		var timestampEl = document.createElement('span');
+		timestampEl.style.color = '#858585';
+		timestampEl.textContent = '[' + timestamp + ']';
+		var messageEl = document.createElement('span');
+		messageEl.style.color = color;
+		messageEl.textContent = prefix + String(text == null ? '' : text);
+		outputEl.appendChild(timestampEl);
+		outputEl.appendChild(document.createTextNode(' '));
+		outputEl.appendChild(messageEl);
+		outputEl.appendChild(document.createTextNode('\\n'));
 		outputEl.scrollTop = outputEl.scrollHeight;
 	}
 	
 	function updateStatus(status, color) {
-		statusEl.innerHTML = '● ' + status;
+		statusEl.textContent = '● ' + status;
 		statusEl.style.color = color;
 	}
 	
@@ -205,9 +211,9 @@ return view.extend({
 		
 		isAuthenticated = false;
 		updateStatus('连接中...', 'orange');
-		appendOutput('正在连接到 ${wsUrl}', 'info');
+		appendOutput('正在连接到 ' + wsUrl, 'info');
 		
-		ws = new WebSocket('${wsUrl}');
+		ws = new WebSocket(wsUrl);
 		
 		ws.onopen = function() {
 			// 如果需要认证，先发送认证信息
@@ -321,7 +327,7 @@ return view.extend({
 	
 	// 清空按钮
 	clearBtn.onclick = function() {
-		outputEl.innerHTML = '';
+		outputEl.textContent = '';
 	};
 	
 	// 快捷命令按钮
@@ -354,4 +360,3 @@ return view.extend({
 	handleSave: null,
 	handleReset: null
 });
-

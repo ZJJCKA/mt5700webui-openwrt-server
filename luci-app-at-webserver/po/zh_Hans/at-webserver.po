@@ -157,9 +157,6 @@ msgstr "请先在配置页面设置日志文件路径，然后重启服务。"
 msgid "前往配置"
 msgstr "前往配置"
 
-msgid "日志文件"
-msgstr "日志文件"
-
 msgid "刷新"
 msgstr "刷新"
 
@@ -298,12 +295,6 @@ msgstr "后再查看日志。"
 msgid "读取系统日志失败: %s"
 msgstr "读取系统日志失败: %s"
 
-msgid "通知日志"
-msgstr "通知日志"
-
-msgid "未配置日志文件"
-msgstr "未配置日志文件"
-
 msgid "读取通知日志失败: %s"
 msgstr "读取通知日志失败: %s"
 
@@ -324,12 +315,6 @@ msgstr "✓ 通知日志已清空"
 
 msgid "清空失败: %s"
 msgstr "清空失败: %s"
-
-msgid "刷新"
-msgstr "刷新"
-
-msgid "清空日志"
-msgstr "清空日志"
 
 msgid "配置已保存，正在停止服务..."
 msgstr "配置已保存，正在停止服务..."
